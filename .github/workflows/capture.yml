@@ -1,0 +1,103 @@
+# Planificateur gratuit de l'ingestion WEC.
+#
+# À placer dans un dépôt GitHub PUBLIC dédié (ex. RomainFl50/wec-capture), sous
+# .github/workflows/capture.yml : les minutes Actions y sont illimitées. Le
+# dépôt ne contient que ce fichier ; le secret reste dans les secrets GitHub et
+# n'apparaît jamais dans les journaux.
+#
+# Fonctionnement :
+#  - toutes les 5 min (cron GitHub, parfois retardé de quelques minutes), un run
+#    appelle /api/ingest/tick sur le site ;
+#  - le tick répond nextPollSec : 0 hors week-end de course (le run s'arrête
+#    aussitôt, la base n'est pas sollicitée), 300 pendant un week-end sans séance
+#    en piste (le cron suffit), 30 quand une séance est en piste (le run boucle
+#    toutes les 30 s jusqu'à la fin de la séance) ;
+#  - au-delà de ~5 h 40 de boucle, le run se relance lui-même via
+#    workflow_dispatch (autorisé avec le GITHUB_TOKEN, sans jeton personnel) ;
+#  - chaque run réactive le workflow : GitHub désactive les crons d'un dépôt
+#    public après 60 jours sans activité, ce qui couvrirait l'intersaison.
+#
+# Pré-requis (une fois) :
+#  - secret  CRON_SECRET = même valeur que la variable CRON_SECRET sur Vercel ;
+#  - variable BASE_URL   = https://wec-dashboard-rho.vercel.app
+
+name: Capture WEC
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      sid:
+        description: "Archiver une séance précise (backfill ponctuel, ex. 18162). Vide = capture normale."
+        required: false
+        default: ""
+
+concurrency:
+  group: capture
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Garder le cron actif pendant l'intersaison
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/capture.yml/enable" || true
+
+      - name: Boucle d'ingestion
+        env:
+          BASE_URL: ${{ vars.BASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+          SID: ${{ github.event.inputs.sid }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ -z "${CRON_SECRET}" ] || [ -z "${BASE_URL}" ]; then
+            echo "::error::Configurer le secret CRON_SECRET et la variable BASE_URL."; exit 1
+          fi
+          # Backfill ponctuel : un seul appel ?sid=… puis sortie.
+          if [ -n "${SID:-}" ]; then
+            echo "Backfill de la séance ${SID}…"
+            code=$(curl -sS -m 70 -o out.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${CRON_SECRET}" "${BASE_URL}/api/ingest/tick?sid=${SID}" || echo 000)
+            echo "http=${code}"; cat out.json
+            [ "${code}" = "200" ] || { echo "::error::Backfill échoué (http=${code})"; exit 1; }
+            exit 0
+          fi
+          deadline=$(( $(date +%s) + 340 * 60 ))
+          fails=0
+          while :; do
+            code=$(curl -sS -m 70 -o out.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${CRON_SECRET}" "${BASE_URL}/api/ingest/tick" || echo 000)
+            next=$(python3 -c "import json;print(int(json.load(open('out.json')).get('nextPollSec') or 0))" 2>/dev/null || echo 0)
+            summary=$(python3 -c "
+          import json
+          d = json.load(open('out.json'))
+          live = ','.join(str(s['sid']) for s in d.get('live', []))
+          fin = ','.join(str(f['sid']) for f in d.get('finals', []) if f.get('stored'))
+          print(f\"live=[{live}] archivées=[{fin}] erreurs={len(d.get('errors', []))}\")" 2>/dev/null || head -c 200 out.json)
+            echo "$(date -u +%H:%M:%S) http=${code} next=${next}s ${summary}"
+            if [ "${code}" != "200" ]; then
+              fails=$((fails + 1))
+              if [ "${fails}" -ge 10 ]; then echo "::error::10 échecs consécutifs"; exit 1; fi
+              next=30
+            else
+              fails=0
+            fi
+            # Rien en piste : le prochain run planifié reprendra la main.
+            if [ "${next}" -le 0 ] || [ "${next}" -gt 60 ]; then break; fi
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "Durée max atteinte, relance du workflow."
+              gh workflow run capture.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" || true
+              break
+            fi
+            sleep "${next}"
+          done
