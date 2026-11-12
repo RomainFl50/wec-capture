@@ -23,7 +23,7 @@ on:
       endurancepy_ref:
         description: "Réf git d'EndurancePy à installer"
         required: false
-        default: "feat/season-driver-pace"
+        default: "main"
       dashboard_ref:
         description: "Branche de wec-dashboard à mettre à jour"
         required: false
