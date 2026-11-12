@@ -27,7 +27,7 @@ on:
       dashboard_ref:
         description: "Branche de wec-dashboard à mettre à jour"
         required: false
-        default: "feat/multi-saisons"
+        default: "main"
 
 concurrency:
   group: build-season-data
