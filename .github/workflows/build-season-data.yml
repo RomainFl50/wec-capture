@@ -1,0 +1,81 @@
+# Génère les données multi-saisons du dashboard et les commit dans le dépôt
+# PRIVÉ wec-dashboard. Hébergé ici (dépôt PUBLIC) car ses minutes GitHub Actions
+# sont illimitées, contrairement au dépôt privé dont le budget est limité.
+#
+# Toute la logique métier vit dans EndurancePy ; tools/build_season_data.py
+# (dans wec-dashboard) ne fait qu'appeler le package et sérialiser en JSON.
+#
+# Pré-requis : un secret DASHBOARD_PAT = Personal Access Token avec accès en
+# écriture (contents: write) au dépôt RomainFl50/wec-dashboard. À créer dans
+# GitHub (Settings → Developer settings → Personal access tokens) puis ajouter
+# dans ce dépôt (Settings → Secrets and variables → Actions → New repository
+# secret, nom DASHBOARD_PAT).
+
+name: Build season data
+
+on:
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: "Années à générer (séparées par un espace)"
+        required: false
+        default: "2024 2025 2026"
+      endurancepy_ref:
+        description: "Réf git d'EndurancePy à installer"
+        required: false
+        default: "feat/season-driver-pace"
+      dashboard_ref:
+        description: "Branche de wec-dashboard à mettre à jour"
+        required: false
+        default: "feat/multi-saisons"
+
+concurrency:
+  group: build-season-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout wec-dashboard (privé, via PAT)
+        uses: actions/checkout@v4
+        with:
+          repository: RomainFl50/wec-dashboard
+          ref: ${{ inputs.dashboard_ref }}
+          token: ${{ secrets.DASHBOARD_PAT }}
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache des téléchargements Al Kamel
+        uses: actions/cache@v4
+        with:
+          path: .endurancepy-cache
+          key: endurancepy-cache-${{ inputs.seasons }}
+          restore-keys: endurancepy-cache-
+
+      - name: Installer EndurancePy
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "endurancepy @ git+https://github.com/RomainFl50/EndurancePy.git@${{ inputs.endurancepy_ref }}"
+
+      - name: Générer les JSON par saison
+        run: |
+          python tools/build_season_data.py --seasons ${{ inputs.seasons }} \
+            --out public/data/seasons --seed-dir lib/seed --cache .endurancepy-cache
+
+      - name: Commit des données dans wec-dashboard si elles ont changé
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/data/seasons
+          if git diff --cached --quiet; then
+            echo "Aucun changement de données."
+          else
+            git commit -m "data: régénérer les données multi-saisons (${{ inputs.seasons }})"
+            git push origin HEAD:${{ inputs.dashboard_ref }}
+          fi
